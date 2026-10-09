@@ -123,3 +123,112 @@ GO
 -- 2. Yedekleme (Backup)
 BACKUP DATABASE NovaStoreDB TO DISK = 'C:\Yedek\NovaStoreDB.bak';
 GO
+
+-- =========================================================================
+-- BÖLÜM 6: EKSTRA İLERİ DÜZEY GELİŞTİRMELER (BONUS)
+-- =========================================================================
+
+-- 1. Veri Bütünlüğü Kısıtlamaları (Check Constraints)
+ALTER TABLE Products 
+ADD CONSTRAINT CK_Products_Price CHECK (Price >= 0),
+    CONSTRAINT CK_Products_Stock CHECK (Stock >= 0);
+
+ALTER TABLE OrderDetails 
+ADD CONSTRAINT CK_OrderDetails_Quantity CHECK (Quantity > 0);
+GO
+
+-- 2. Performans İndeksleri (Non-Clustered Indexes)
+CREATE NONCLUSTERED INDEX IX_Orders_CustomerID ON Orders(CustomerID);
+CREATE NONCLUSTERED INDEX IX_OrderDetails_OrderID_ProductID ON OrderDetails(OrderID, ProductID);
+CREATE NONCLUSTERED INDEX IX_Products_CategoryID ON Products(CategoryID);
+GO
+
+-- 3. Stok Takip Trigger'ı (Otomatik Stok Düşürme & Kontrol)
+CREATE TRIGGER trg_OrderDetails_StockUpdate
+ON OrderDetails
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF EXISTS (
+        SELECT 1 
+        FROM Products p
+        JOIN inserted i ON p.ProductID = i.ProductID
+        WHERE p.Stock < i.Quantity
+    )
+    BEGIN
+        RAISERROR('HATA: Yetersiz stok! Sipariş işlemi geri alındı.', 16, 1);
+        ROLLBACK TRANSACTION;
+        RETURN;
+    END
+
+    UPDATE p
+    SET p.Stock = p.Stock - i.Quantity
+    FROM Products p
+    JOIN inserted i ON p.ProductID = i.ProductID;
+END;
+GO
+
+-- 4. Dinamik Müşteri Segmentasyon Fonksiyonu (Scalar Function)
+CREATE FUNCTION dbo.fn_GetCustomerSegment (@CustomerID INT)
+RETURNS VARCHAR(20)
+AS
+BEGIN
+    DECLARE @TotalSpent DECIMAL(10,2);
+    DECLARE @Segment VARCHAR(20);
+
+    SELECT @TotalSpent = ISNULL(SUM(TotalAmount), 0)
+    FROM Orders
+    WHERE CustomerID = @CustomerID;
+
+    IF @TotalSpent >= 10000
+        SET @Segment = 'Platin VIP';
+    ELSE IF @TotalSpent >= 1000
+        SET @Segment = 'Altın Üye';
+    ELSE
+        SET @Segment = 'Standart';
+
+    RETURN @Segment;
+END;
+GO
+
+-- 5. Güvenli Sipariş Oluşturma Saklı Yordamı (Transaction ile Stored Procedure)
+CREATE PROCEDURE sp_CreateNewOrder
+    @CustomerID INT,
+    @ProductID INT,
+    @Quantity INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        DECLARE @UnitPrice DECIMAL(10,2);
+        SELECT @UnitPrice = Price FROM Products WHERE ProductID = @ProductID;
+
+        IF @UnitPrice IS NULL
+        BEGIN
+            RAISERROR('Ürün bulunamadı!', 16, 1);
+        END
+
+        DECLARE @OrderTotal DECIMAL(10,2) = @UnitPrice * @Quantity;
+
+        INSERT INTO Orders (CustomerID, OrderDate, TotalAmount)
+        VALUES (@CustomerID, GETDATE(), @OrderTotal);
+
+        DECLARE @NewOrderID INT = SCOPE_IDENTITY();
+
+        INSERT INTO OrderDetails (OrderID, ProductID, Quantity)
+        VALUES (@NewOrderID, @ProductID, @Quantity);
+
+        COMMIT TRANSACTION;
+        PRINT 'Sipariş başarıyla oluşturuldu ve stok trigger ile düşürüldü.';
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END;
+GO
